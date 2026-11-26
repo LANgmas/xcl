@@ -4622,6 +4622,7 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::cpu_writes::ProbeSite;
     use std::sync::Arc;
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
@@ -7510,6 +7511,200 @@ mod tests {
             std::thread::yield_now();
         }
         true
+    }
+
+
+    /// Test-only guard resetting the probe-script seam even when a test panics. On ordinary
+    /// completion it also fails the test for unexpected or unconsumed probes, so every worker
+    /// probe must be explicitly authorized by the script.
+    struct ProbeSequenceReset(usize);
+    impl Drop for ProbeSequenceReset {
+        fn drop(&mut self) {
+            let problem = super::super::cpu_writes::probe_script_problem(self.0);
+            super::super::cpu_writes::clear_probe_script(self.0);
+            if !std::thread::panicking() {
+                if let Some(problem) = problem {
+                    panic!("probe script for queue {:#x} did not match the worker: {problem}", self.0);
+                }
+            }
+        }
+    }
+
+    unsafe fn d116_assert_no_store_or_publication(va: usize) {
+        let memory = d11_read(va);
+        let (stored, published, _) = d11_cell_state(va);
+        assert_eq!(memory, 0, "the sentinel must never count as producer completion - nothing may be stored (memory={memory} stored_max={stored} cpu_signaled_max={published})");
+        assert_eq!(stored, 0, "watermark must not advance on removal (memory={memory} stored_max={stored} cpu_signaled_max={published})");
+        assert_eq!(published, 0, "no publication may occur on removal (memory={memory} stored_max={stored} cpu_signaled_max={published})");
+    }
+
+    /// D1.16: the initial worker probe returning UINT64_MAX (the device-removal sentinel)
+    /// must be classified as removal BEFORE any numeric completion comparison. A deferred
+    /// SyncU64 must never be stored or published on removal. Deterministic fake-fence probe
+    /// test - not physical device-removal validation.
+    #[test]
+    fn d116_initial_probe_sentinel_is_removal_not_completion() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q = d11_queue(&dev);
+            let qr = q.as_raw() as usize;
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            let _reset = ProbeSequenceReset(qr);
+            super::super::cpu_writes::arm_probe_script(qr, &[(ProbeSite::StrictPickup, u64::MAX), (ProbeSite::LegacyNonStrict, u64::MAX)]);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            let marker = Box::leak(Box::new(0u32));
+            let mva = marker as *const u32 as usize;
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::Immediate(mva, vec![1])]);
+            let progressed = d11_wait_until(|| (*(mva as *const AtomicU32)).load(Ordering::Acquire) == 1, 6);
+            assert!(progressed, "worker hung on the sentinel job");
+            d116_assert_no_store_or_publication(va);
+        }
+    }
+
+    /// D1.16 R3: Freebuff's exact counterexample. The first probe is genuinely incomplete;
+    /// the next probe returns the sentinel. The frozen implementation re-probed numerically
+    /// at pickup and skipped the wait (`MAX < value` is false), storing and publishing as if
+    /// the producer had completed. The corrected worker classifies every probe.
+    #[test]
+    fn d116_second_probe_sentinel_is_removal_not_completion() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q = d11_queue(&dev);
+            let qr = q.as_raw() as usize;
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            let _reset = ProbeSequenceReset(qr);
+            super::super::cpu_writes::arm_probe_script(qr, &[(ProbeSite::StrictPickup, 0), (ProbeSite::StrictPolling(0), u64::MAX), (ProbeSite::LegacyNonStrict, u64::MAX)]);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            let marker = Box::leak(Box::new(0u32));
+            let mva = marker as *const u32 as usize;
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::Immediate(mva, vec![1])]);
+            let progressed = d11_wait_until(|| (*(mva as *const AtomicU32)).load(Ordering::Acquire) == 1, 6);
+            assert!(progressed, "worker hung on the sentinel job");
+            d116_assert_no_store_or_publication(va);
+        }
+    }
+
+    /// D1.16 R3.1: a polling probe returning UINT64_MAX after one incomplete pickup must be
+    /// removal, never completion. The site-aware script itself proves polling: a duplicate
+    /// pickup cannot consume the polling expectation, and any missing or out-of-order probe
+    /// fails the test. The queue hold is signalled before return.
+    #[test]
+    fn d116_polling_probe_sentinel_is_removal_not_completion() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q = d11_queue(&dev);
+            let qr = q.as_raw() as usize;
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            q.Wait(&hold, 1).unwrap();
+            let _reset = ProbeSequenceReset(qr);
+            super::super::cpu_writes::arm_probe_script(qr, &[(ProbeSite::StrictPickup, 0), (ProbeSite::StrictPolling(0), u64::MAX), (ProbeSite::LegacyNonStrict, u64::MAX)]);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert_eq!(d11_read(va), 0, "setup: nothing may be stored while the producer is incomplete");
+            let marker = Box::leak(Box::new(0u32));
+            let mva = marker as *const u32 as usize;
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::Immediate(mva, vec![1])]);
+            let progressed = d11_wait_until(|| (*(mva as *const AtomicU32)).load(Ordering::Acquire) == 1, 8);
+            hold.Signal(1).unwrap();
+            assert!(progressed, "worker hung on the sentinel job");
+            d116_assert_no_store_or_publication(va);
+        }
+    }
+
+    /// D1.16 R3.1 control: an incomplete pickup followed by valid completion at polling
+    /// iteration zero still stores and publishes normally. UINT64_MAX - 1 is a valid high
+    /// completion value without depending on the job's exact fence target; only UINT64_MAX
+    /// itself is the removal sentinel.
+    #[test]
+    fn d116_incomplete_then_valid_completion_stores_and_publishes() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q = d11_queue(&dev);
+            let qr = q.as_raw() as usize;
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            let _reset = ProbeSequenceReset(qr);
+            super::super::cpu_writes::arm_probe_script(qr, &[(ProbeSite::StrictPickup, 0), (ProbeSite::StrictPolling(0), 0), (ProbeSite::StrictPolling(1), 0), (ProbeSite::StrictPolling(2), u64::MAX - 1)]);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "valid completion never stored");
+            let (stored, _, _) = d11_cell_state(va);
+            assert_eq!(stored, 100, "memory truth did not advance after valid completion");
+            assert!(d11_wait_until(|| d11_cell_state(va).1 == 100, 5), "valid completion was never published");
+        }
+    }
+
+    /// D1.16 R3 lifecycle check: dropping a strict job for removal is per-job state, not a
+    /// poisoned worker. Once the drop is complete and the script is disarmed, a later valid
+    /// strict job on the same worker still stores and publishes. This records the existing
+    /// worker lifecycle contract; it does not add a recovery guarantee to production.
+    #[test]
+    fn d116_valid_strict_job_after_removal_drop_stores_and_publishes() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q = d11_queue(&dev);
+            let qr = q.as_raw() as usize;
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            {
+                let _reset = ProbeSequenceReset(qr);
+                super::super::cpu_writes::arm_probe_script(qr, &[(ProbeSite::StrictPickup, u64::MAX), (ProbeSite::LegacyNonStrict, u64::MAX)]);
+                super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+                let marker = Box::leak(Box::new(0u32));
+                let mva = marker as *const u32 as usize;
+                super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::Immediate(mva, vec![1])]);
+                let progressed = d11_wait_until(|| (*(mva as *const AtomicU32)).load(Ordering::Acquire) == 1, 6);
+                assert!(progressed, "worker hung on the sentinel job");
+                d116_assert_no_store_or_publication(va);
+            }
+
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "valid job after the dropped one never stored");
+            let (stored, _, _) = d11_cell_state(va);
+            assert_eq!(stored, 100, "memory truth did not advance for the valid recovery job");
+            assert!(d11_wait_until(|| d11_cell_state(va).1 == 100, 5), "valid job after the dropped one was never published");
+        }
+    }
+
+    /// D1.16 R3 legacy control: non-strict bottom-of-pipe writes deliberately keep their
+    /// pre-existing numeric probe semantics. With the queue genuinely held incomplete, an
+    /// injected UINT64_MAX still skips the legacy wait and the Immediate write lands promptly.
+    /// This documents the unchanged legacy behaviour; it does not apply to strict SyncU64 jobs.
+    #[test]
+    fn d116_legacy_non_strict_probe_behavior_is_unchanged() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q = d11_queue(&dev);
+            let qr = q.as_raw() as usize;
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q.Wait(&hold, 1).unwrap();
+            let _reset = ProbeSequenceReset(qr);
+            super::super::cpu_writes::arm_probe_script(qr, &[(ProbeSite::LegacyNonStrict, u64::MAX)]);
+            let marker = Box::leak(Box::new(0u32));
+            let mva = marker as *const u32 as usize;
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::Immediate(mva, vec![1])]);
+            let wrote = d11_wait_until(|| (*(mva as *const AtomicU32)).load(Ordering::Acquire) == 1, 5);
+            hold.Signal(1).unwrap();
+            assert!(wrote, "legacy non-strict numeric probe behaviour changed");
+        }
     }
 
     /// Test 2: publication causality. Memory alone does not release the consumer - only
