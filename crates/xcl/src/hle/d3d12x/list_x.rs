@@ -2209,6 +2209,18 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
 /// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
+/// A wait recorded after its own command list's CPU-deferred Write64 of the value it waits for,
+/// which the record-time split could not move to a segment of its own: hoisting it before the
+/// list is a deadlock (the deferred store needs this list's own completion) and skipping it
+/// drops the ordering - it is enforced on the submission thread after the list is submitted.
+unsafe fn is_deferred_self_wait(w: &PendingWait, list_writes: &[(u64, u64)]) -> bool {
+    if !w.after_write64 || w.width != 8 || w.is_satisfied() || !list_writes.iter().any(|&(wva, wv)| wva == w.va && wv >= w.value) {
+        return false;
+    }
+    let g = SYNC_GRAPH.lock().unwrap();
+    g.as_ref().and_then(|gr| gr.cells.get(&w.va)).is_some_and(|c| c.deferred && c.submitted_max < w.value)
+}
+
 pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
@@ -2234,8 +2246,36 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all_on(queue, waits, list_writes);
-        start = i;
+        // The record-time split is what orders a wait behind this list's own deferred Write64
+        // exactly. Where no split was possible the wait is neither hoisted (deadlock: the store
+        // needs this list's completion) nor skipped (the ordering is lost): the list is
+        // submitted alone, then the wait is enforced on the submission thread - the producer
+        // retires independently, so this cannot deadlock - before anything after it.
+        let mut deferred_self: Vec<PendingWait> = Vec::new();
+        let mut normal: Vec<PendingWait> = Vec::new();
+        for w in waits {
+            if is_deferred_self_wait(w, list_writes) {
+                deferred_self.push(*w);
+            } else {
+                normal.push(*w);
+            }
+        }
+        if deferred_self.is_empty() {
+            wait_all_on(queue, waits, list_writes);
+            start = i;
+            continue;
+        }
+        if !normal.is_empty() {
+            wait_all_on(queue, &normal, list_writes);
+        }
+        submit(&lists[i..i + 1]);
+        start = i + 1;
+        for w in &deferred_self {
+            if !w.wait_until_satisfied(wait_timeout()) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                warn(&N, "Wait64BitValueX", format_args!("deferred self-wait at {:#x} timed out - the producer never completed", w.va));
+            }
+        }
     }
     if start < lists.len() {
         submit(&lists[start..]);
@@ -7874,6 +7914,150 @@ mod tests {
     impl Drop for RemovalInjectReset {
         fn drop(&mut self) {
             super::super::cpu_writes::REMOVAL_INJECT_QUEUE.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// D1.9 P1 regression (review: deferred same-batch self-wait). A deferred sync-cell
+    /// Write64 and a later wait on the same cell recorded in one command list, on a list with
+    /// no console wrapper to split the recording. The self-wait must not be silently dropped:
+    /// GPU work submitted behind the waiting list may only run once the deferred store really
+    /// landed. Unfixed: the wait takes CycleSkip, the trailing copy executes first and reads 0.
+    #[test]
+    fn d19_deferred_self_wait_is_not_dropped_for_following_work() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (va, up, rb) = d11_cell_buffers(&dev);
+
+            // Two real lists: the first carries the write + wait records (no GPU work of its
+            // own - the deferred write is CPU-side), the second the dependent copy. No console
+            // wrapper exists for either, so the record-time split cannot help: the residual
+            // path the review covers.
+            let alloc1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc1, None).unwrap();
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None).unwrap();
+            cl2.CopyBufferRegion(&rb, 0, &up, 0, 16);
+            cl2.Close().unwrap();
+            let l1 = cl1.as_raw();
+            let l2 = cl2.as_raw();
+            // (leaked: the per-list state is keyed by this pointer, which must not be recycled)
+            std::mem::forget(cl1.clone());
+
+            // Production record path: deferred sync-cell write, then the same-list wait.
+            write64_bottom_x(l1, va as u64, 100, 0, 0);
+            wait64_x(l1, va as u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 100, 0, 0);
+            {
+                // The wait must have been recorded (not dropped at record time), flagged as
+                // following the list's own Write64, on the original list: with no wrapper the
+                // split cannot move it.
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().and_then(|m| m.get(&(l1 as usize))).expect("list state");
+                assert_eq!(s.pending_waits.len(), 1, "the wait was not recorded");
+                assert!(s.pending_waits[0].after_write64, "the wait follows the list's own Write64");
+                assert!(!s.write64_signals.is_empty(), "the write64 signal was not recorded");
+                assert!(!s.cpu_writes.is_empty(), "the deferred write was not recorded");
+            }
+            cl1.Close().unwrap();
+
+            // Production submission path: one batch, chunk handling as q_execute_command_lists.
+            execute_with_waits_on(q.as_raw(), &[l1, l2], |chunk| {
+                let raws: Vec<Option<ID3D12CommandList>> = chunk
+                    .iter()
+                    .map(|&p| ID3D12CommandList::from_raw_borrowed(&p).cloned())
+                    .collect();
+                q.ExecuteCommandLists(&raws);
+                signal_write64_fences(q.as_raw(), chunk);
+                cpu_writes_after(q.as_raw(), chunk);
+            });
+            q.Signal(&done, 1).unwrap();
+            let t = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 {
+                assert!(t.elapsed().as_secs() < 12, "queue never finished");
+                std::thread::yield_now();
+            }
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            let observed = (rbptr as *const u64).read();
+            let sentinel = ((rbptr as *const u64).add(1)).read();
+            assert_eq!(sentinel, 0x5E4710E1_5E4710E1u64, "the dependent copy itself did not execute");
+            // the store must land eventually regardless; what matters is what the copy observed
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "the deferred store never landed");
+            on_release(l1 as usize);
+            assert_eq!(observed, 100, "GPU work after the self-wait observed {observed:#x} - it executed before the deferred marker existed");
+        }
+    }
+
+    /// D1.9: the same title recording through a real `title_list` wrapper - deferred Write64,
+    /// Wait64 on that cell, then a copy, all in ONE title command list. The record-time split
+    /// puts the wait and the copy on a second PC segment; the wait is bridged to the cell's
+    /// fence, which only the store publishes. The producer segment is held on the GPU: nothing
+    /// behind the wait may run, and the copy must read the stored value once it is released.
+    #[test]
+    fn d19_title_list_self_wait_orders_the_work_recorded_after_it() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (va, up, rb) = d11_cell_buffers(&dev);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            std::mem::forget(alloc.clone());
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            super::super::bind::reset(pc0, alloc.as_raw() as usize, 0);
+            let wrap = super::super::title_list::wrap(pc0);
+
+            // The title's recording, through the production entry points.
+            write64_bottom_x(pc0, va as u64, 100, 0, 0);
+            wait64_x(pc0, va as u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 100, 0, 0);
+            let mut segs = Vec::new();
+            assert!(super::super::title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 2, "the Wait64 after the list's own Write64 must split the recording");
+            let seg1 = segs[1];
+            {
+                let g = LISTS.lock().unwrap();
+                let m = g.as_ref().unwrap();
+                assert!(m.get(&(pc0 as usize)).is_some_and(|s| s.pending_waits.is_empty() && !s.cpu_writes.is_empty()), "the deferred write stays on the first segment");
+                assert!(m.get(&(seg1 as usize)).is_some_and(|s| s.pending_waits.len() == 1 && s.write64_signals.is_empty()), "the wait is recorded on the second segment");
+            }
+            type CopyFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+            pc::<CopyFn>(seg1, PC_COPY_BUFFER_REGION)(seg1, rb.as_raw(), 0, up.as_raw(), 0, 16);
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0, "Close on the split title list failed");
+
+            // The producer segment cannot complete until `hold` is signalled.
+            q.Wait(&hold, 1).unwrap();
+            let t = std::time::Instant::now();
+            execute_with_waits_on(q.as_raw(), &segs, |chunk| {
+                type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+                let exec: ExecFn = std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+                exec(q.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                signal_write64_fences(q.as_raw(), chunk);
+                cpu_writes_after(q.as_raw(), chunk);
+            });
+            q.Signal(&done, 1).unwrap();
+            assert!(t.elapsed().as_millis() < 1500, "the submission thread was blocked: the wait was not bridged to the GPU");
+
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(d11_read(va), 0, "stored before the producer segment completed");
+            assert_eq!(d11_cell_state(va).1, 0, "published before the store");
+            assert_eq!(done.GetCompletedValue(), 0, "work after the wait ran before the deferred marker existed");
+
+            hold.Signal(1).unwrap();
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "the deferred store never landed");
+            assert!(d11_wait_until(|| done.GetCompletedValue() >= 1, 5), "the work after the wait was never released");
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            assert_eq!(((rbptr as *const u64).add(1)).read(), 0x5E4710E1_5E4710E1u64, "the copy recorded after the wait did not execute");
+            assert_eq!((rbptr as *const u64).read(), 100, "the copy recorded after the wait read the cell before the store");
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
         }
     }
 
